@@ -1,0 +1,576 @@
+#!/usr/bin/perl -wT
+# Please Replace -wT when Developing.
+# Tool To Replicate Detabases using the Record Numbers in them.
+# by Omar Al-Sakka - 23/10/2002
+###############################################################################
+
+### External Libs/Modules.
+###############################################################################
+use strict;
+use DBI;
+use Getopt::Std;
+#use diagnostics;                                
+
+### Some Globals.
+###############################################################################
+my $default_config="/home/omar/usr/dbsync/dbsync.conf";   # Default Config File
+my $ver="0.3p";                                           # Version Number.
+my %config;                                               # Configuration Hash.
+
+### Simple Date Function, Pad With Zeroes.
+###############################################################################
+sub date_string {
+  my ($time) = shift(@_) || return 0;
+  my ($month) = ('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug',
+                 'Sep','Oct','Nov','Dec' )[(localtime($time))[4]];
+  my ($mday,$year,$hour,$min) = (localtime($time))[3,5,2,1];
+  if ($min<10)  { $min = "0$min"; }
+  if ($mday<10) { $mday= "0$mday"; }
+  return "$month-$mday-".($year+1900)."\@$hour.$min";
+}
+
+### Print Message and Exit.
+###############################################################################
+sub panic {
+  if ("@_" eq "") { print qq|$0: $!\n|; }
+  else { print qq|$0: @_\n|; }
+  exit(1);
+}
+
+### Log to file.
+###############################################################################
+sub logger {
+  my $current_date = date_string(time);
+  if ( open (LOGFILE,">>$config{'*g*'}{logfile}") ) {
+    if ("@_" eq "") { print LOGFILE qq|$0:$current_date:$!\n|; }
+    else { print LOGFILE qq|$0:$current_date:@_\n|; }
+    close (LOGFILE);
+  } else { &panic ("cannot create log file."); }
+}
+
+### Debug Output.
+###############################################################################
+sub debug {
+  if (defined($config{'*g*'}{debugging})) {
+    my $current_date = date_string(time);
+    if ( open (DFILE,">>$config{'*g*'}{debugfile}") ) {
+      if ("@_" eq "") { print DFILE qq|$0:$current_date:$!\n|; }
+      else { print DFILE qq|$0:$current_date:@_\n|; }
+      close (DFILE);
+    } else { &logger("debug file not found."); }
+  }
+}
+
+# Draw a Line.
+###############################################################################
+sub line { print "$_[0]" x $_[1] . "\n"; }
+
+### Check Command.
+### input: Action (checktype), Variable, Description.
+### Check Types: 0 Defined, 1 File is Writable.
+###############################################################################
+sub chk {
+  my ($action, $variable, $message) = @_;
+  if (defined($variable)) { 
+    if ($action) { 
+      if ( -w "$variable" ) { &debug("$message - ok"); }
+      else { &panic("CONFIG ERROR: file not found $message."); }
+    }
+    &debug("$message - ok"); 
+  }
+  else { &panic("CONFIG ERROR: undefined $message."); }
+}
+
+### Verify the Configuration.
+###############################################################################
+sub verify_config {
+  # Do This for Every Defined Item.
+  # &logger ("verifying configuration.");
+  foreach my $i (keys %config) {
+    if ($i eq "*g*") {
+      &chk(0,$config{$i}{logfile},    "log file");
+      &chk(0,$config{$i}{lockfile},   "lock file");
+      &chk(0,$config{$i}{debugfile},  "debug file");
+      &chk(0,$config{$i}{statusfile}, "status file");
+      &chk(0,$config{$i}{cycletime},  "cycle time");
+    }
+    else {
+      &chk(0,$config{$i}{rct}, "$i record fetch count");
+      &chk(0,$config{$i}{key}, "$i source incremental key");
+      &chk(0,$config{$i}{src}{type}, "$i source data type");
+      &chk(0,$config{$i}{src}{host}, "$i source hostname");
+      &chk(0,$config{$i}{src}{user}, "$i source username");
+      &chk(0,$config{$i}{src}{pass}, "$i source password");
+      &chk(0,$config{$i}{src}{dbnm}, "$i source database");
+      &chk(0,$config{$i}{src}{tbnm}, "$i source table");
+      &chk(0,$config{$i}{dst}{type}, "$i destination data type");
+      &chk(0,$config{$i}{dst}{host}, "$i destination hostname");
+      &chk(0,$config{$i}{dst}{user}, "$i destination username");
+      &chk(0,$config{$i}{dst}{pass}, "$i destination password");
+      &chk(0,$config{$i}{dst}{dbnm}, "$i destination database");
+      &chk(0,$config{$i}{dst}{tbnm}, "$i destination table");
+    }
+  } &logger ("configuration loaded - ok");
+}
+
+### Read Config File.
+###############################################################################
+sub read_config {
+  my $sun=0;            # Sync Unique Name.
+  my $dis=0;            # Disabeled Field.
+  if (!$_[0]) { panic ("unspecified configuration file."); }
+  if ( open (CFG, "$_[0]") ) {
+    while (<CFG>) {
+      chomp ($_);       # ensure no return.
+      s/\t/ /g;         # Replace tabs by space.
+      s/\s/ /g;         # Replace Whitespaces with space.
+      s/\s+$//g;        # Remove WhiteSpaces at endof-line.
+      next if /^\s*\#/; # Ignore a Comment.
+      next if /^\s*$/;  # Ignore empty line.
+      next if /^\s+$/;  # ignore white space.
+      # Disabeled Flag.
+      if (/^!(\w+):\s*{\s*$/) { $dis = 1; next; }
+      # Get Sync Unique Name.
+      if (/^(\w+):\s*{\s*$/) { $sun = "$1"; next; }
+      # Get End-of Sync Block.
+      if (/^\s*}\s*$/) { $dis = 0; $sun = 0; next; }
+      # Skip If Disabeled.
+      next if ($dis);
+      # Load a description.
+      if ($sun) {
+        if (/^\s*(\w+)\s*(.*)\s*$/) { 
+          if ( (lc($1) eq "src") or (lc($1) eq "dst") ) {
+            my $sdf = lc($1); # Source/Destination Flag.
+            # Parse the Source/Destination Fields.
+            if ($2 =~ /^\s*(\w+)\[(.*)\]@(\w+):([\w\.]+):(\w+)\.(\w+)\s*$/) {
+              $config{$sun}{$sdf}{user} = "$1"; # UserName.
+              $config{$sun}{$sdf}{pass} = "$2"; # Password.
+              $config{$sun}{$sdf}{type} = "$3"; # Data Source Type.
+              $config{$sun}{$sdf}{host} = "$4"; # HostName.
+              $config{$sun}{$sdf}{dbnm} = "$5"; # Database Name.
+              $config{$sun}{$sdf}{tbnm} = "$6"; # Table Name.
+              next;
+            }
+          }
+          else { $config{$sun}{lc($1)} = "$2"; next; }
+        }
+      }
+      # Load Global Settings.
+      if (/^(\w+)\s*(.*)\s*$/) { 
+        $config{'*g*'}{lc($1)} = "$2"; 
+        next; 
+      }
+      # Error if we Reach Here.
+      panic ("syntax error, line $. of configuration file.");
+    }
+    close (CFG);
+    panic ("unterminated sync block error.") if ($sun);
+  }
+  else { panic ("opening configuration file '$_[0]' failed."); }
+  &verify_config;
+}
+
+# Redump Configuration File.
+###############################################################################
+sub dump_config {
+  my $count=0;
+
+  foreach my $i (sort keys (%config)) {
+    &debug ("$i");
+    $count++ if ($i ne "*g*");
+    foreach my $j (sort keys %{$config{$i}}) {
+      if ($config{$i}{$j} =~ m/^HASH\((.*)\)$/) {
+        foreach my $k (sort keys %{$config{$i}{$j}}) {
+          &debug ("  $j - $k: $config{$i}{$j}{$k}");
+        }
+      } else { &debug ("  $j: $config{$i}{$j}"); }
+    }
+  } panic ("ok - [$count]");
+}
+
+### Databases Functions to do.
+### Input: Sync Unique Name, and SRC/DST Flag as input.
+###############################################################################
+sub db {
+  my $first=1;                        # First Entry for SQL Query.
+  my $flags;                          # Additional Flags for Creation.
+  my @tstruct="";                     # Temp Structure Holder.
+  my ($action, $sun) = @_;            # Input (action, sun, src/dst).
+  my ($sth, $sth2, $query);           # database and statement handles.
+  &debug("---| DATABASE:-> $action -> $sun");
+  # Databases Source and Destination.
+  my $d_src="DBI:$config{$sun}{src}{type}:"
+           ."$config{$sun}{src}{dbnm}:$config{$sun}{src}{host}";
+  my $d_dst="DBI:$config{$sun}{dst}{type}:"
+           ."$config{$sun}{dst}{dbnm}:$config{$sun}{dst}{host}";
+  # Debug Output DataSource Strings.
+  &debug("DATA SRC($sun): -> $d_src");
+  &debug("DATA DST($sun): -> $d_dst");
+
+  # Connect to Source Database.
+  if ( my $s_dbh = DBI->connect ($d_src, $config{$sun}{src}{user}, 
+                       $config{$sun}{src}{pass}, { RaiseError => 0 }) ) {
+    &debug("SRC: connect as user $config{$sun}{src}{user} "
+          ."to host $config{$sun}{src}{host} - ok");
+    # Connect to Destination Database.
+    if ( my $d_dbh = DBI->connect ($d_dst, $config{$sun}{dst}{user},
+                         $config{$sun}{dst}{pass}, { RaiseError => 0 }) ) {
+      &debug("DST: connect as user $config{$sun}{dst}{user} "
+            ."to host $config{$sun}{dst}{host} - ok");
+      # Sync Data between 2 Databases.
+      if ($action eq "sync") { 
+        $query = "SELECT * from $config{$sun}{src}{tbnm} where "
+               . "$config{$sun}{key} > " . ($config{$sun}{status})
+               . " and " . "$config{$sun}{key} <= " 
+               . ($config{$sun}{status}+$config{$sun}{rct}) . "\n";
+        $sth = $s_dbh->prepare($query);
+        &debug("-\n$query");
+        $sth->execute;
+        @tstruct = split (" ", $config{$sun}{struct});
+	      while (my @row_ary = $sth->fetchrow_array) {
+          $query = "INSERT INTO $config{$sun}{dst}{tbnm} SET\n";
+          foreach my $i (0 .. $#tstruct) {
+            # Make Sure We Dont Overrun the Max Value.
+            $config{$sun}{status} = "$row_ary[$i]" 
+              if ( $tstruct[$i] eq $config{$sun}{key} );
+            $query .= ", " if (!$first);
+            if (defined($row_ary[$i])) { 
+              $query .= "$tstruct[$i] = \"$row_ary[$i]\"\n";
+            } else { $query .= "$tstruct[$i] = \"\"\n"; }
+            $first=0;
+	     	  }
+          # Do the Insert
+          $sth2 = $d_dbh->prepare($query);
+          $sth2->execute;
+          $first=1; # Reset First Variable.
+        }
+      }
+      # Try To Get Last Value in the Destination Database.
+      elsif ($action eq "lvl") {
+        $query  = "SELECT MAX($config{$sun}{key}) "
+                . "FROM $config{$sun}{dst}{tbnm}\n";
+        $sth = $s_dbh->prepare($query);
+        &debug("-\n$query");
+        $sth->execute;
+        my @row_ary = $sth->fetchrow_array;
+        $sth->finish;
+        $s_dbh->disconnect;
+        $d_dbh->disconnect;
+        if (defined($row_ary[0])) {
+          &debug("LAST VALUE -> $row_ary[0]");
+          return $row_ary[0];
+        } else { return 0; }
+      }
+      # Try to get Start Value From the Source Database.
+      elsif ($action eq "svl") {
+        $query  = "SELECT MIN($config{$sun}{key}) "
+                . "FROM $config{$sun}{src}{tbnm}\n";
+        $sth = $s_dbh->prepare($query);
+        &debug("-\n$query");
+        $sth->execute;
+        my @row_ary  = $sth->fetchrow_array;
+        $sth->finish;
+        $s_dbh->disconnect;
+        $d_dbh->disconnect;
+        if (defined($row_ary[0])) {
+          &debug("START VALUE -> $row_ary[0]");
+          return $row_ary[0];
+        } else { return 0; }
+      }
+      # Initialise the Database for First Time Use.
+      # Create a Table in the Database.
+      elsif ($action eq "init") { 
+        # Get The Table Structure from Source.
+        $query = "SHOW COLUMNS from $config{$sun}{src}{tbnm}\n";
+        $sth = $s_dbh->prepare($query);
+        &debug("-\n$query");
+        $sth->execute;
+        $query = "CREATE TABLE $config{$sun}{dst}{tbnm} (\n";
+        # MYSQL TABLE FORMAT AS FOLLOWS:
+        # 0.Field, 1.Type, 2.Null, 3.Key, 4.Default, 5.Extra.
+        while (my @row_ary = $sth->fetchrow_array) {
+          # Specify Any Additionl Flags.
+          if ( $row_ary[0] eq "$config{$sun}{key}" ) { $flags="UNIQUE"; }
+          else { $flags=""; } 
+          $query .= "\t";
+          $query .= ", " if (!$first);
+          $query .= "$row_ary[0] $row_ary[1] $flags\n";
+          $first=0;
+          # Make an Array for the Table Structure.
+          $config{$sun}{struct} .= "$row_ary[0] ";
+        }
+        $query .= "\t)\n";
+        # Replicate Table Structure on Destination.
+        $sth2 = $d_dbh->prepare($query);
+        &debug("-\n$query");
+        $sth2->execute;
+      }
+      else { panic ("invalid db call."); }
+      # Disconnect from Databases.
+      $s_dbh->disconnect;
+      $d_dbh->disconnect;
+      return 1;
+    }
+    # Cannot Contact Destination Host.
+    else { 
+      logger("unable to contact destination host '$sun'."); 
+      $s_dbh->disconnect;
+      return 0;
+    }
+  }
+  # Cannot Contact Source Host.
+  else {
+    logger("unable to contact source host '$sun'.");
+    return 0;
+  }
+}
+
+### Status File, Stores the Key Value Currently Reached.
+### Format: SUN:LAST:CURR:FIELDS
+###############################################################################
+sub status {
+  my ($action) = @_; # Input (action).
+  my $smess;         # Status Message.
+  my $count=0;       # Record Counter.
+  
+  &debug("---| STATUS:-> $action");
+  # Read the Status.
+  #############################################################################
+  if ($action eq "get") {
+    if (open (STATUS, "$config{'*g*'}{statusfile}") ) {
+      while (<STATUS>) {
+        chomp($_);
+        if (/^([A-Z_a-z]+):(\d+):(\d+):(.*)\s*$/) {
+          # Get Value only if Already Defined.
+          if (defined($config{lc($1)})) {
+            $config{lc($1)}{lstats} = $2;
+            $config{lc($1)}{status} = $3;
+            $config{lc($1)}{struct} = $4;
+          }
+          next;
+        } logger ("Error in Status File Line $..");
+      } close (STATUS);
+    } else { &status ("put"); }
+  }
+  # User Status Request.
+  #############################################################################
+  elsif ($action eq "report") {
+    if (open (STATUS, "$config{'*g*'}{statusfile}") ) {
+      # Set Report Format.
+      my $format  = "format STATUS = \n  "
+                  . '@' . '<' x 20 . ' ' x  2 . '@' . '>' x 12 . ' ' x  2
+                  . '@' . '<' x 12 . "\n" . '$1, $2, $smess' . "\n.";
+      eval $format;
+      $~ = "STATUS";
+      # Check Daemon State.
+      my $dstate = "/proc/" . &lock("?");
+      if ( -e "$dstate" ) { $dstate = "Running"; }
+      else { $dstate = "Stopped"; }
+      # Print out Report.
+      print "\n  [$dstate]" . ' ' x  12 . "$0 v$ver Status Viewer\n"
+          . ' ' x  2 . '-' x 48 . "\n"
+          . "  Sync ID" . ' ' x 15 . "Last Record ID  Status\n"
+          . ' ' x  2 . '-' x 48 . "\n";
+      while (<STATUS>) {
+        chomp($_);
+        if (/^([A-Z_a-z]+):(\d+):(\d+):(.*)\s*$/) {
+          # Sync Message.
+          if ( $2 != 0 ) {
+            if ( $2 == $3 ) { $smess="syncd"; }
+            else { $smess="ok"; }
+          } else { $smess="sync fail"; }
+          write;
+          ( $count++ );
+          next;
+        } logger ("Error in Status File Line $..");
+      } 
+      close (STATUS);
+      print ' ' x  2 . '-' x 48 . "\n" . "  Total: $count\n\n";
+    } else { &status ("put"); }
+  }
+  # Write the Status.
+  #############################################################################
+  elsif ($action eq "put") {
+    if (open (STATUS, ">$config{'*g*'}{statusfile}") ) {
+      foreach my $i (sort keys (%config)) {
+        if ($i ne "*g*") {
+          # Set To SVL - Start Value.
+          # If not specified set to Minimum Value in Source Database.
+          # *Will Return Proper Value, or Zero If problem Occurs.
+          if (!defined($config{$i}{status})) {
+            if (defined($config{$i}{svl})) {
+              $config{$i}{status} = $config{$i}{svl}; 
+            }  
+            # Try the Automation Route.
+            else { 
+              if ( $config{$i}{status} = &db("lvl", $i) ) { 
+                &logger ("$i: auto - last value used.");
+              }
+              else { 
+                $config{$i}{status} = &db("svl", $i); 
+                &logger ("$i: auto - start value used.");
+              }
+            }
+          }
+          # Ensure No Blank Values.
+          $config{$i}{lstats} = 0  if (!defined($config{$i}{lstats}));
+          $config{$i}{struct} = "" if (!defined($config{$i}{struct}));
+          print STATUS "$i:$config{$i}{lstats}:$config{$i}{status}:"
+                      ."$config{$i}{struct}\n";
+          # Set last status value to status value.
+          $config{$i}{lstats} = $config{$i}{status};
+        }
+      } close (STATUS);
+    } else { panic ("Could not write Status File."); }
+  } else { panic ("Unknow Status Request."); }
+}
+
+### Run through Sync Once.
+###############################################################################
+sub sync_once {
+  &status("get"); # Read the Status File.
+  foreach my $i (sort keys (%config)) {
+    if ($i ne "*g*") {
+      # Initialize the Database if no Structure was Found.
+      # OtherWise Sync Some Records.
+      if ($config{$i}{struct} eq "") { 
+        &db("init", $i) &&
+          &logger("initialized destination table for $i.");
+      }
+      else { 
+        if ( &db("sync", $i) ) {
+          if ($config{$i}{status} != $config{$i}{lstats}) {
+            &logger("$i synchronized tables - " 
+                  . "last key value $config{$i}{status}.");
+          }
+          else { 
+            if (!$config{$i}{status}) {
+              &logger("$i table synchronization error or empty tables!");
+            } else { &logger("$i tables are synchronized."); }
+          }
+        } else { &logger("$i synchronization failed!"); }
+      }
+    }
+  }
+  &status("put");  # Write Status File.
+}
+
+
+### Locking Functions.
+### 1 for Lock, ? for Verify.
+###############################################################################
+sub lock {
+  my ($action) = @_; # Input (action).
+  if ($action eq "1") {
+    # Write The PID to the Lock File.
+    if ( open (LOCK, "> $config{'*g*'}{lockfile}") ) {
+      print LOCK "$$\n";
+      close (LOCK);
+      return 1;
+    } return 0;
+  }
+  elsif ($action eq "0") {
+    # Delete the File if it Exists.
+    if ( unlink ("$config{'*g*'}{lockfile}") ) { return 1; }
+    else { return 0; }
+  }
+  elsif ($action eq "?") {
+    # Get PID from Lock file if Available.
+    if ( open (LOCK, "$config{'*g*'}{lockfile}") ) {
+      while (<LOCK>) { chomp($_);  return "$_"; }
+      close (LOCK);
+    } return -1;
+  }
+  else { &panic ("lock call error"); }
+}
+
+
+### Reset Status.
+###############################################################################
+sub reset_status {
+  if ( -e $config{'*g*'}{statusfile} ) {
+    panic ("Error resetting status!") if
+      ( !(unlink("$config{'*g*'}{lockfile}")) );
+  }
+}
+
+### Daemon.
+###############################################################################
+sub daemonize {
+  # Check if a Process is Running.
+  my $tpid  ="/proc/";
+     $tpid .=&lock("?");
+  panic ("daemon already running.") if ( -e "$tpid" );
+  # Daemonize.
+  close(STDOUT);
+  close(STDERR);
+  fork && exit;
+  # Lock, otherwise Abort.
+  if (&lock ("1")) {
+    &logger("Daemonizing.");
+    # Loop while PID in Lock is Mine.
+    while ( &lock("?") eq "$$" ) {
+      $0 = "dbsync";
+      &sync_once;
+      $0 = "dbsync [idle...]";
+      sleep ($config{'*g*'}{cycletime});
+    }
+  } else { &logger("Failed to lock daemon, aborting...."); }
+}
+
+### Terminate Daemon.
+###############################################################################
+sub terminate {
+  # Unlock and Log, or Panic.
+  if ( &lock("0") ) { &logger ("daemon terminated."); }
+  else { panic ("No Daemon Detected."); }
+}
+
+### Help.
+###############################################################################
+sub help {
+  print STDERR << "EOHelp";
+$0 v$ver Quick Help.
+
+  usage: $0 [-1dsvrRt] [-c 'config file']
+
+  -1    Run Through Synchronization Sequence.
+  -d    Start Synchronization Daemon.
+  -t    Terminate Synchronization Daemon.
+  -c    Specify Configuration File.
+  -v    Verify Configuration File.
+  -s    Synchronization Status(s).
+  -r    Restart Daemon.
+  -R    Reset Synchronization Status.
+        NOTE: This requires the daemon to be stopped!
+
+EOHelp
+  exit(1);
+}
+
+### Command Line Menu.
+###############################################################################
+sub cl_menu {
+  my $options = '1dsvtrRc:';
+  my $s=0;  # Success!
+
+  getopts("$options", \my %opt) or &help;
+   if ($opt{c}) { $s=1; &read_config("$opt{c}"); }
+   else { &read_config("$default_config"); }
+   if ($opt{v}) { $s=1; &dump_config; }
+   if ($opt{1}) { $s=1; &sync_once; }
+   if ($opt{d}) { $s=1; &daemonize; }
+   if ($opt{t}) { $s=1; &terminate; }
+   if ($opt{s}) { $s=1; &status("report"); }
+   if ($opt{r}) { $s=1; &terminate; &daemonize; }
+   if ($opt{R}) { $s=1; &reset_status; }
+  &help if ($s==0); # Nothing Specified!
+}
+
+### Start Everything Here.
+###############################################################################
+MAIN: { 
+  $|++;           # Force Auto-Flush of Output Buffer.
+  $0 = "dbsync";  # Change PS Name.
+  &cl_menu;       # CL Menu (getopt).
+}
